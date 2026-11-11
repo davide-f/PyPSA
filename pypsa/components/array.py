@@ -11,6 +11,7 @@ DataArray for each variable.
 from __future__ import annotations
 
 import copy
+import warnings
 from typing import TYPE_CHECKING, NoReturn
 
 import numpy as np
@@ -18,7 +19,11 @@ import pandas as pd
 import xarray as xr
 
 from pypsa._options import options
-from pypsa.common import UnexpectedError, as_index, list_as_string
+from pypsa.common import (
+    UnexpectedError,
+    as_index,
+    list_as_string,
+)
 from pypsa.components.abstract import _ComponentsABC
 from pypsa.guards import _assert_xarray_integrity
 
@@ -26,6 +31,21 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from pypsa import Components
+
+
+def _strings_to_object(
+    data: pd.DataFrame | pd.Series,
+) -> pd.DataFrame | pd.Series:
+    """Cast string columns to object dtype, which xarray needs for values.
+
+    See https://github.com/pydata/xarray/issues/10301.
+    """
+    if isinstance(data, pd.Series):
+        return data.astype(object) if isinstance(data.dtype, pd.StringDtype) else data
+    str_cols = [
+        col for col, dtype in data.dtypes.items() if isinstance(dtype, pd.StringDtype)
+    ]
+    return data.astype(dict.fromkeys(str_cols, object)) if str_cols else data
 
 
 def _from_xarray(da: xr.DataArray, c: Components) -> pd.DataFrame | pd.Series:
@@ -41,6 +61,12 @@ def _from_xarray(da: xr.DataArray, c: Components) -> pd.DataFrame | pd.Series:
     If name or scenarios (if stochastic) are missing, they will be expanded to cover them
 
     """
+    # Restore the snapshot MultiIndex from a flat build's tuple labels once
+    # here, rather than at every caller.
+    window = c.n_save._snapshot_window
+    if window is not None:
+        da = window.recompose(da)
+
     # Add missing dimensions if needed
     if "name" not in da.dims:
         da = da.expand_dims(name=c.names)
@@ -127,7 +153,7 @@ class _XarrayAccessor:
         component = self._get_component()
         try:
             return component._as_xarray(attr=attr)
-        except AttributeError as e:
+        except (AttributeError, KeyError) as e:
             msg = f"'{component.__class__.__name__}' components has no attribute '{attr}'."
             raise AttributeError(msg) from e
 
@@ -239,7 +265,11 @@ class ComponentsArrayMixin(_ComponentsABC):
         snapshots : pandas.Index
             Restrict to these snapshots rather than n.snapshots.
         inds : pandas.Index
-            Restrict to these components rather than n.components.index
+            Restrict to these component names rather than all components. For
+            stochastic networks, the names are selected in all scenarios. The
+            columns follow component order, duplicates are collapsed and unknown
+            names dropped. In PyPSA 2.0, columns follow `inds` order, duplicates
+            are kept and unknown names raise a `KeyError`.
 
         Returns
         -------
@@ -268,7 +298,17 @@ class ComponentsArrayMixin(_ComponentsABC):
 
         # Filter names
         if inds is not None:
-            index = index.intersection(inds)
+            index = index[index.get_level_values("name").isin(inds)]
+            if not index.unique("name").equals(pd.Index(inds)):
+                warnings.warn(
+                    "In PyPSA 2.0, `get_switchable_as_dense` will return columns in "
+                    "`inds` order, keep duplicates and raise a `KeyError` for "
+                    "unknown names. To keep the current result, pass unique, known "
+                    "names in component order, e.g. "
+                    "`n.c.<component>.static.index.unique('name').intersection(inds)`.",
+                    FutureWarning,
+                    stacklevel=3,
+                )
 
         # Find columns that need to be filled from static data
         diff = index.difference(dynamic.columns)
@@ -330,11 +370,16 @@ class ComponentsArrayMixin(_ComponentsABC):
 
         """
         if attr == "active":
-            res = xr.DataArray(self.get_activity_mask())
+            data = self.get_activity_mask()
         elif attr in self.dynamic.keys():
-            res = xr.DataArray(self._as_dynamic(attr))
+            data = self._as_dynamic(attr)
         else:
-            res = xr.DataArray(self.static[attr])
+            data = self.static[attr]
+        return self._to_xarray(data, attr)
+
+    def _to_xarray(self, data: pd.Series | pd.DataFrame, name: str) -> xr.DataArray:
+        """Convert component data indexed like `static` or `dynamic` to a DataArray."""
+        res = xr.DataArray(_strings_to_object(data))
 
         # Unstack the dimension that contains the scenarios
         if self.has_scenarios:
@@ -348,10 +393,14 @@ class ComponentsArrayMixin(_ComponentsABC):
             res = res.transpose(*[c for c in res.coords if c in res.dims])
 
         # Set attibute name as DataArray name
-        res.name = attr
+        res.name = name
 
         # Optional runtime verification
         if options.debug.runtime_verification:
             _assert_xarray_integrity(self, res)
+
+        window = self.n_save._snapshot_window
+        if window is not None:
+            res = window.flatten(res)
 
         return res

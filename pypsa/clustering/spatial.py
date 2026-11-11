@@ -202,7 +202,7 @@ def flatten_multiindex(m: pd.MultiIndex, join: str = " ") -> pd.Index:
     --------
     >>> m = pd.MultiIndex.from_tuples([("a", "b"), ("c", "d")])
     >>> flatten_multiindex(m)
-    Index(['a b', 'c d'], dtype='object')
+    Index(['a b', 'c d'], dtype='str')
 
     """
     return m if m.nlevels <= 1 else m.to_flat_index().str.join(join).str.strip()
@@ -481,7 +481,7 @@ def aggregatelines(
                 continue
 
             strategy = dynamic_strategies[attr]
-            data = n.get_switchable_as_dense("Line", attr, inds=idx)
+            data = n.get_switchable_as_dense("Line", attr, inds=idx.unique("name"))
 
             if strategy == "capacity_weighted_average":
                 data = data * capacity_weights

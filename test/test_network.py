@@ -3,8 +3,10 @@
 # SPDX-License-Identifier: MIT
 
 import copy
+import pickle
 import sys
 import warnings
+from pathlib import Path
 
 import linopy
 import numpy as np
@@ -69,6 +71,37 @@ def test_remove(ac_dc_network):
 
     assert not generators.issubset(n.c.generators.static.index)
     assert not generators.issubset(n.c.generators.dynamic.p_max_pu.columns)
+
+
+def test_remove_with_unnamed_dynamic_columns(ac_dc_network):
+    n = ac_dc_network
+    c = n.c.generators
+    c.dynamic.p_max_pu = c.dynamic.p_max_pu.rename_axis(columns=None)
+
+    n.remove("Generator", "Manchester Wind")
+
+    assert "Manchester Wind" not in c.dynamic.p_max_pu.columns
+
+
+def test_remove_stochastic(ac_dc_stochastic):
+    """Components are removed from all scenarios (#1955)."""
+    n = ac_dc_stochastic
+    c = n.c.generators
+
+    generators = ["Manchester Wind", "Frankfurt Wind"]
+
+    n.remove("Generator", generators)
+    n.remove("GlobalConstraint", "co2_limit")
+
+    assert not c.static.index.isin(generators, level="name").any()
+    assert list(c.dynamic.p_max_pu.columns) == [
+        ("low", "Norway Wind"),
+        ("high", "Norway Wind"),
+    ]
+    assert n.c.global_constraints.static.empty
+
+    with pytest.raises(KeyError):
+        n.remove("Generator", "Manchester Wind")
 
 
 def test_remove_misspelled_component(ac_dc_network):
@@ -498,6 +531,50 @@ def test_add_list_suffix_misaligned_kwarg_raises(n_5bus):
         )
 
 
+def test_multiport_assignment_defaults_single_add():
+    """
+    Add a single link to a network, then add a second link with additional
+    ports.
+
+    Check that the default values are assigned to the first link.
+    """
+    n = pypsa.Network()
+    n.add("Bus", "bus")
+    n.add("Bus", "bus2")
+    n.add("Link", "link", bus0="bus", bus1="bus2")
+    n.add("Link", "link2", bus0="bus", bus1="bus2", bus2="bus")
+    assert n.c.links.static.loc["link", "bus2"] == ""
+
+
+def test_multiport_assignment_defaults_multiple_add():
+    """
+    Add a single link to a network, then add a second link with additional
+    ports.
+
+    Check that the default values are assigned to the first link.
+    """
+    n = pypsa.Network()
+    n.add("Bus", "bus")
+    n.add("Bus", "bus2")
+    n.add("Link", ["link"], bus0="bus", bus1="bus2")
+    n.add("Link", ["link2"], bus0="bus", bus1="bus2", bus2="bus")
+    assert n.c.links.static.loc["link", "bus2"] == ""
+
+
+def test_331():
+    """
+    See https://github.com/PyPSA/PyPSA/issues/331.
+    """
+    n = pypsa.Network()
+    n.add("Bus", "bus")
+    n.add("Load", "load", bus="bus", p_set=10)
+    n.add("Generator", "generator1", bus="bus", p_nom=15, marginal_cost=10)
+    n.optimize()
+    n.add("Generator", "generator2", bus="bus", p_nom=5, marginal_cost=5)
+    n.optimize()
+    assert "generator2" in n.c.generators.dynamic.p
+
+
 @pytest.mark.skipif(
     sys.platform == "win32",
     reason="pd.equals fails on windows (https://stackoverflow.com/questions/62128721).",
@@ -543,6 +620,103 @@ def test_copy_default_behavior(networks):
     assert n is not network_copy
 
 
+COPY_METHODS = {
+    "copy": lambda n: n.copy(),
+    "deepcopy": copy.deepcopy,
+    "pickle": lambda n: pickle.loads(pickle.dumps(n)),
+    "copy_snapshots": lambda n: n.copy(snapshots=n.snapshots[:3]),
+}
+
+
+@pytest.mark.parametrize(
+    ("network", "method"),
+    [
+        (network, method)
+        for network in ["ac_dc_network", "ac_dc_stochastic"]
+        for method in COPY_METHODS
+        if not (network == "ac_dc_stochastic" and method == "copy_snapshots")
+    ],
+)
+def test_copy_relinks_sub_networks(request, network, method):
+    """
+    Copies own SubNetwork objects linked to the copy, the original stays linked.
+    See https://github.com/PyPSA/PyPSA/issues/1888 and #1930.
+    """
+    n = request.getfixturevalue(network)
+    n.determine_network_topology()
+    n_copy = COPY_METHODS[method](n)
+    subs = n.c.sub_networks.static.obj
+    subs_copy = n_copy.c.sub_networks.static.obj
+    assert len(subs) > 0
+    assert subs_copy.index.equals(subs.index)
+    for sub, sub_copy in zip(subs, subs_copy, strict=True):
+        assert sub is not sub_copy
+        assert sub.n is n
+        assert sub_copy.n is n_copy
+    assert n.equals(n_copy) == (method != "copy_snapshots")
+
+
+@pytest.mark.parametrize("network", ["ac_dc_network", "ac_dc_stochastic"])
+def test_equals_skips_sub_networks(request, network):
+    """Networks differ in topology columns and component data, not in SubNetworks."""
+    n = request.getfixturevalue(network)
+    n_without_topology = n.copy()
+    n.determine_network_topology()
+    n_other_lines = n.copy()
+    n_other_lines.c.lines.static["x"] *= 2
+    assert not n.equals(n_without_topology)
+    assert not n.equals(n_other_lines)
+
+
+def test_shallow_copy_keeps_original_sub_networks(ac_dc_network):
+    """copy.copy shares SubNetwork objects and leaves them linked to the original."""
+    n = ac_dc_network
+    n.determine_network_topology()
+    copy.copy(n)
+    assert all(sub.n is n for sub in n.c.sub_networks.static.obj)
+
+
+@pytest.mark.parametrize("copy_method", COPY_METHODS.values(), ids=COPY_METHODS)
+def test_copy_keeps_snapshot_names(ac_dc_periods, copy_method):
+    """Copies keep the name of multi-indexed snapshots, see #1937."""
+    n_copy = copy_method(ac_dc_periods)
+    assert n_copy.snapshots.name == "snapshot"
+    assert n_copy.snapshot_weightings.index.name == "snapshot"
+    assert n_copy.c.generators.dynamic.p.index.name == "snapshot"
+    assert n_copy.c.generators.da.p_max_pu.dims == ("snapshot", "name")
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "period"),
+    [
+        ({"snapshots": pd.MultiIndex.from_product([[2030], range(2)])}, 2030),
+        ({"investment_periods": [2020]}, 2020),
+    ],
+)
+def test_copy_selects_investment_periods(kwargs, period):
+    """Selecting snapshots or investment periods on copy selects the other."""
+    n = pypsa.Network()
+    n.snapshots = pd.MultiIndex.from_product([[2020, 2030], range(2)])
+    n.investment_periods = [2020, 2030]
+    n.add("Bus", "bus")
+    n.add("Generator", "gen", bus="bus", p_nom=10, marginal_cost=1)
+    n.add("Load", "load", bus="bus", p_set=5)
+    n_copy = n.copy(**kwargs)
+    assert n_copy.investment_periods.tolist() == [period]
+    assert n_copy.snapshots.unique("period").tolist() == [period]
+    status, _ = n_copy.optimize(multi_investment_periods=True)
+    assert status == "ok"
+
+
+def test_copy_snapshots_keeps_crs(ac_dc_network):
+    """Selective copies keep a non-default coordinate reference system."""
+    n = ac_dc_network
+    n.to_crs(3035)
+    n_copy = n.copy(snapshots=n.snapshots[:3])
+    assert n_copy.crs == n.crs
+    assert n_copy.c.buses.static.x.equals(n.c.buses.static.x)
+
+
 def test_copy_with_model(ac_dc_network):
     n = ac_dc_network
     n.optimize.create_model()
@@ -565,6 +739,50 @@ def test_copy_with_model(ac_dc_network):
         match="Copying a solved network with an attached solver model is not supported.",
     ):
         n_copy = n.copy()
+
+
+def test_1319():
+    """
+    Copying a solved network should work after setting solver_model to None.
+    See https://github.com/PyPSA/PyPSA/issues/1319.
+    """
+    n = pypsa.examples.ac_dc_meshed()
+    n.optimize()
+
+    # Should raise error when trying to copy with solver_model attached
+    with pytest.raises(
+        ValueError, match="Copying a solved network with an attached solver model"
+    ):
+        n.copy()
+
+    # Should work after setting solver_model to None
+    n.model.solver_model = None
+    n_copy = n.copy()  # Should not raise an error
+    assert n_copy is not n
+    assert len(n_copy.buses) == len(n.c.buses.static)
+
+
+def test_1420(tmp_path):
+    """
+    Network pickling should not cause RecursionError in xarray accessor.
+    See https://github.com/PyPSA/PyPSA/issues/1420.
+    """
+    n = pypsa.Network()
+    n.add("Bus", "bus")
+    n.add("Generator", "gen", bus="bus", p_nom=100)
+
+    pickle_file = tmp_path / "network.pkl"
+
+    with Path(pickle_file).open("wb") as out:
+        pickle.dump(n, out)
+
+    with Path(pickle_file).open("rb") as inp:
+        n_loaded = pickle.load(inp)
+
+    # Verify network was loaded correctly
+    assert len(n_loaded.c.buses.static) == 1
+    assert len(n_loaded.c.generators.static) == 1
+    # tmp_path is automatically cleaned up by pytest
 
 
 @pytest.mark.skipif(

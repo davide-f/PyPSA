@@ -54,6 +54,7 @@ from pypsa.network.power_flow import (
 )
 from pypsa.network.transform import NetworkTransformMixin
 from pypsa.optimization.optimize import OptimizationAccessor
+from pypsa.optimization.window import SnapshotWindow
 from pypsa.plot.accessor import PlotAccessor
 from pypsa.plot.maps import explore
 from pypsa.statistics.expressions import StatisticsAccessor
@@ -90,6 +91,7 @@ class Network(
     _multi_invest: int
     _linearized_uc: int
     _committable_big_m: float | None
+    _optimize_window: SnapshotWindow | None
     iteration: int
 
     # ----------------
@@ -161,6 +163,7 @@ class Network(
         self._objective_constant: float | None = None
         self._multi_invest: int = 0
         self._committable_big_m: float | None = None
+        self._optimize_window: SnapshotWindow | None = None
 
         # Initialize accessors
         self.optimize: OptimizationAccessor = OptimizationAccessor(self)
@@ -312,6 +315,46 @@ class Network(
 
         """
         return self.equals(other)
+
+    def __setstate__(self, state: dict) -> None:
+        """Restore state and the references lost on pickling."""
+        self.__dict__.update(state)
+        self._restore_references()
+
+    def __copy__(self) -> Network:
+        """Return a shallow copy, sharing data and SubNetwork objects with the original."""
+        n = self.__class__.__new__(self.__class__)
+        n.__dict__.update(self.__dict__)
+        return n
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> Network:
+        """Return a deep copy, including SubNetwork objects linked to the copy."""
+        n = self.__class__.__new__(self.__class__)
+        memo[id(self)] = n
+        n.__dict__.update(copy.deepcopy(self.__dict__, memo))
+        n._copy_sub_networks(memo)
+        n._restore_references()
+        return n
+
+    def _copy_sub_networks(self, memo: dict[int, Any]) -> None:
+        """Replace SubNetwork objects with deep copies, which pandas shares on copy."""
+        static = self.c.sub_networks.static
+        if "obj" in static:
+            static["obj"] = [copy.deepcopy(sub, memo) for sub in static["obj"]]
+
+    def _restore_references(self) -> None:
+        """Restore snapshot index names and SubNetwork parent references.
+
+        pandas drops the name of a `pd.MultiIndex` on any copy, view or pickling, and
+        pickling drops the SubNetwork weakrefs.
+        """
+        self._snapshots_data.index.name = "snapshot"
+        for c in self.components:
+            for df in c.dynamic.values():
+                df.index.name = "snapshot"
+        for sub in self.c.sub_networks.static.get("obj", []):
+            if isinstance(sub, SubNetwork):
+                sub._n = ref(self)
 
     def __getitem__(self, key: str) -> Network:
         """Return a shallow slice of the Network object.
@@ -493,6 +536,9 @@ class Network(
     def equals(self, other: Any, log_mode: str = "silent") -> bool:
         """Check for equality of two networks.
 
+        Sub-networks are not compared, since they are derived from the other
+        components. The `sub_network` columns of buses and branches are compared.
+
         Parameters
         ----------
         other : Any
@@ -530,13 +576,20 @@ class Network(
             PlotAccessor,
             AbstractStatisticsAccessor,
             linopy.Model,
+            SnapshotWindow,
         ]
         not_equal = False
         if isinstance(other, self.__class__):
             for key, value in self.__dict__.items():
+                other_value = other.__dict__[key]
+                if key == "_components":
+                    value = {k: v for k, v in value.items() if k != "sub_networks"}
+                    other_value = {
+                        k: v for k, v in other_value.items() if k != "sub_networks"
+                    }
                 if not equals(
                     value,
-                    other.__dict__[key],
+                    other_value,
                     ignored_classes=ignore,
                     log_mode=log_mode,
                     path="n." + key,
@@ -654,28 +707,32 @@ class Network(
         <BLANKLINE>
         Variables:
         ----------
-        * Generator-p_nom (name)
-        * Line-s_nom (name)
-        * Link-p_nom (name)
-        * Generator-p (snapshot, name)
-        * Line-s (snapshot, name)
-        * Link-p (snapshot, name)
-        * objective_constant
+         * Generator-p_nom (name)
+         * Line-s_nom (name)
+         * Link-p_nom (name)
+         * Generator-p (snapshot, name)
+         * Line-s (snapshot, name)
+         * Link-p (snapshot, name)
+         * objective_constant
+        <BLANKLINE>
+        Expressions:
+        ------------
+        <empty>
         <BLANKLINE>
         Constraints:
         ------------
-        * Generator-ext-p_nom-lower (name)
-        * Line-ext-s_nom-lower (name)
-        * Link-ext-p_nom-lower (name)
-        * Generator-ext-p-lower (snapshot, name)
-        * Generator-ext-p-upper (snapshot, name)
-        * Line-ext-s-lower (snapshot, name)
-        * Line-ext-s-upper (snapshot, name)
-        * Link-ext-p-lower (snapshot, name)
-        * Link-ext-p-upper (snapshot, name)
-        * Bus-nodal_balance (name, snapshot)
-        * Kirchhoff-Voltage-Law (snapshot, cycle)
-        * GlobalConstraint-co2_limit
+         * Generator-ext-p_nom-lower (name)
+         * Line-ext-s_nom-lower (name)
+         * Link-ext-p_nom-lower (name)
+         * Generator-ext-p-lower (snapshot, name)
+         * Generator-ext-p-upper (snapshot, name)
+         * Line-ext-s-lower (snapshot, name)
+         * Line-ext-s-upper (snapshot, name)
+         * Link-ext-p-lower (snapshot, name)
+         * Link-ext-p-upper (snapshot, name)
+         * Bus-nodal_balance (snapshot, name)
+         * Kirchhoff-Voltage-Law (snapshot, cycle)
+         * GlobalConstraint-co2_limit
         <BLANKLINE>
         Status:
         -------
@@ -890,9 +947,11 @@ class Network(
         ----------
         snapshots : list or tuple or pd.Index , default self.snapshots
             A list of snapshots to copy, must be a subset of n.snapshots. Pass
-            an empty list ignore all snapshots.
+            an empty list ignore all snapshots. Only the investment periods of the
+            selected snapshots are kept.
         investment_periods : list or tuple or pd.Index, default self.investment_period_weightings.index
-            A list of investment periods to copy, must be a subset of n.investment_periods. Pass
+            A list of investment periods to copy, must be a subset of n.investment_periods.
+            If `snapshots` is not given, only the snapshots of these periods are kept.
         ignore_standard_types : boolean, default False
             Ignore the PyPSA standard types.
 
@@ -953,9 +1012,18 @@ class Network(
         # Convert to pandas.Index
         snapshots_ = as_index(self, snapshots, "snapshots")
         investment_periods_ = as_index(self, investment_periods, "investment_periods")
+        if isinstance(snapshots_, pd.MultiIndex) and not investment_periods_.empty:
+            if snapshots is None:
+                snapshots_ = snapshots_[snapshots_.isin(investment_periods_, "period")]
+            elif investment_periods is None:
+                periods = snapshots_.unique("period")
+                investment_periods_ = investment_periods_[
+                    investment_periods_.isin(periods)
+                ]
 
         # Setup new network
         n = self.__class__(ignore_standard_types=ignore_standard_types)
+        n.to_crs(self.crs)
 
         # Copy components
         other_comps = sorted(self.all_components - {"Bus", "Carrier"})
@@ -999,8 +1067,7 @@ class Network(
 
         # Catch all remaining attributes of network
         for attr in [
-            "name",
-            "srid",
+            "_name",
             "_meta",
             "_linearized_uc",
             "_multi_invest",
@@ -1009,9 +1076,11 @@ class Network(
             "_objective_constant",
             "now",
         ]:
-            if hasattr(self, attr):
-                setattr(n, attr, getattr(self, attr))
+            if attr in vars(self):
+                setattr(n, attr, copy.deepcopy(vars(self)[attr]))
 
+        n._copy_sub_networks({})
+        n._restore_references()
         return n
 
     # beware, this turns bools like s_nom_extendable into objects because of
@@ -1093,17 +1162,17 @@ class Network(
         Examples
         --------
         >>> n.passive_branches() # doctest: +ELLIPSIS
-                    active    b  b_pu  ...         x      x_pu  x_pu_eff
-        component                     ...
-        0            True  0.0   0.0  ...  0.796878  0.000006  0.000006
-        1            True  0.0   0.0  ...  0.391560  0.000003  0.000003
-        2            True  0.0   0.0  ...  0.000000  0.000000  0.000000
-        3            True  0.0   0.0  ...  0.000000  0.000000  0.000000
-        4            True  0.0   0.0  ...  0.000000  0.000000  0.000000
-        5            True  0.0   0.0  ...  0.238800  0.000002  0.000002
-        6            True  0.0   0.0  ...  0.400000  0.000003  0.000003
+                        active    b  b_pu  ...         x      x_pu  x_pu_eff
+        component name                     ...
+        Line      0       True  0.0   0.0  ...  0.796878  0.000006  0.000006
+                  1       True  0.0   0.0  ...  0.391560  0.000003  0.000003
+                  2       True  0.0   0.0  ...  0.000000  0.000000  0.000000
+                  3       True  0.0   0.0  ...  0.000000  0.000000  0.000000
+                  4       True  0.0   0.0  ...  0.000000  0.000000  0.000000
+                  5       True  0.0   0.0  ...  0.238800  0.000002  0.000002
+                  6       True  0.0   0.0  ...  0.400000  0.000003  0.000003
         <BLANKLINE>
-        [7 rows x 41 columns]
+        [7 rows x 44 columns]
 
         """
         comps = sorted(
@@ -1143,7 +1212,7 @@ class Network(
                   Bremen Converter     True           0  ...                   1
                   DC link              True           0  ...                   1
         <BLANKLINE>
-        [4 rows x 47 columns]
+        [4 rows x 52 columns]
 
         See Also
         --------
@@ -1170,6 +1239,7 @@ class Network(
         self,
         investment_period: int | str | None = None,
         skip_isolated_buses: bool = False,
+        cycle_basis_method: str = "bfs-refined",
     ) -> Network:
         """Build sub_networks from topology.
 
@@ -1180,6 +1250,17 @@ class Network(
         build_year and lifetime). If the investment_period is specified,
         the network topology is determined on the basis of the active
         branches.
+
+        Parameters
+        ----------
+        investment_period : int or str, optional
+            Investment period to consider when determining active branches.
+        skip_isolated_buses : bool, default False
+            Whether to skip sub-networks consisting of a single bus.
+        cycle_basis_method : str, default "bfs-refined"
+            Method used to construct the cycle basis of each sub-network, either
+            ``"bfs-refined"`` or ``"paton"``.
+
         """
         adjacency_matrix = self.adjacency_matrix(
             branch_components=self.passive_branch_components,
@@ -1227,7 +1308,9 @@ class Network(
                 logger.warning(
                     "Warning, sub network %d is not electric but "
                     "contains multiple buses\nand branches. Passive "
-                    "flows are not allowed for non-electric networks!",
+                    "flows are not allowed for non-electric networks! "
+                    'Use "AC" or "DC" as carrier ("electricity" will '
+                    "not work).",
                     i,
                 )
 
@@ -1262,13 +1345,16 @@ class Network(
                 c.static.loc[~active, "sub_network"] = np.nan
 
         for sub in self.c.sub_networks.static.obj:
-            find_cycles(sub)
+            find_cycles(sub, cycle_basis_method=cycle_basis_method)
             sub.find_bus_controls()
 
         return self
 
     def cycle_matrix(
-        self, investment_period: str | int | None = None, apply_weights: bool = False
+        self,
+        investment_period: str | int | None = None,
+        apply_weights: bool = False,
+        cycle_basis_method: str = "bfs-refined",
     ) -> pd.DataFrame:
         """Get the cycles in the network and represent them as a DataFrame.
 
@@ -1291,6 +1377,9 @@ class Network(
         apply_weights : bool, default False
             Whether to apply weights (e.g., reactance for AC lines,
             resistance for DC lines) to the cycles.
+        cycle_basis_method : str, default "bfs-refined"
+            Method used to construct the cycle basis, either ``"bfs-refined"``
+            or ``"paton"``. The default ``"bfs-refined"`` yields sparser cycles.
 
         Returns
         -------
@@ -1301,7 +1390,9 @@ class Network(
 
         """
         self.determine_network_topology(
-            investment_period=investment_period, skip_isolated_buses=True
+            investment_period=investment_period,
+            skip_isolated_buses=True,
+            cycle_basis_method=cycle_basis_method,
         )
         self.calculate_dependent_values()
 
@@ -1343,7 +1434,9 @@ class Network(
             is_ac = branches.sub_network.map(self.c.sub_networks.static.carrier) == "AC"
             weights = branches.x_pu_eff.where(is_ac, branches.r_pu_eff)
             weights = weights[cycles_df.index]
-            cycles_df = cycles_df.multiply(weights, axis=0)
+            cycles_df = cycles_df.where(
+                cycles_df == 0, cycles_df.multiply(weights, axis=0)
+            )
 
         # Reindex to include all branches (even those not in cycles)
         return cycles_df.reindex(branches_i, fill_value=0).rename_axis(columns="cycle")
@@ -1434,6 +1527,12 @@ class SubNetwork(NetworkGraphMixin, SubNetworkPowerFlowMixin):
         """
         self._n = ref(n)
         self.name = name
+
+    def __getstate__(self) -> dict:
+        """Drop the unpicklable parent weakref, relinked in Network.__setstate__."""
+        state = self.__dict__.copy()
+        state.pop("_n", None)
+        return state
 
     # TODO assign __str__ and __repr__
     @property
@@ -1864,12 +1963,12 @@ class SubNetwork(NetworkGraphMixin, SubNetworkPowerFlowMixin):
     @deprecated(
         deprecated_in="1.0.0",
         removed_in="2.0.0",
-        details="Use `sub_network.components.stores.index.static` instead.",
+        details="Use `sub_network.components.stores.static.index` instead.",
     )
     def stores_i(self) -> pd.Index:
         """Get the index of the stores in the sub-network.
 
-        !!! warning "Deprecated in <!-- md:badge-version
+        !!! warning "Deprecated in <!-- md:badge-version v1.0.0 -->"
 
             Use `sub_network.components.stores.static.index` instead.
 
@@ -1978,7 +2077,7 @@ class SubNetwork(NetworkGraphMixin, SubNetworkPowerFlowMixin):
     @deprecated(
         deprecated_in="1.0.0",
         removed_in="2.0.0",
-        details="Use `!!! deprecated.components.stores.static` instead.",
+        details="Use `sub_network.components.stores.static` instead.",
     )
     def stores(self) -> pd.DataFrame:
         """Get the stores in the sub-network.
