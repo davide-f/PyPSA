@@ -59,8 +59,8 @@ Documentation = "https://docs.pypsa.org"
 [project.optional-dependencies]
 hdf5 = ["tables"]
 smspp = [
-    "pypsa2smspp>=0.0.4",
-    "pysmspp>=0.0.9",
+    "pypsa2smspp @ git+https://github.com/SPSUnipi/pypsa2smspp.git@enable_pandas3",
+    "pysmspp @ git+https://github.com/SPSUnipi/pySMSpp.git@main",
 ]
 cartopy = ["cartopy>=0.16"]
 excel = ["openpyxl", "python-calamine"]
