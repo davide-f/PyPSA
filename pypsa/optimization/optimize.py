@@ -64,9 +64,9 @@ from pypsa.optimization.global_constraints import (
 )
 from pypsa.optimization.piecewise import (
     PiecewiseOptions,
-    SMSppAccessor,
     define_piecewise,
 )
+from pypsa.optimization.smspp import SMSppAccessor
 from pypsa.optimization.variables import (
     define_cvar_variables,
     define_loss_variables,
